@@ -1,0 +1,23 @@
+query_data:
+  history_csv: "./data/train.csv"
+  targets_csv: "./data/val.csv"
+  item_id_column: "item_id"
+  timestamp_column: "timestamp"
+  target_column: "target"
+
+sampling:
+  temperature: 1.0
+  top_p: 0.9
+  num_samples: 100
+  seed: 42
+  lower_quantile_column: "0.1"
+  median_quantile_column: "0.5"
+  upper_quantile_column: "0.9"
+
+models:
+  base_predictor_dir: "./artifacts/base-models/chronos-bolt-base"
+  finetuned_predictor_dir: "./artifacts/final_safetensors"
+
+output:
+  output_root: "./outputs/model_compare"
+  run_label: "chronos_bolt"

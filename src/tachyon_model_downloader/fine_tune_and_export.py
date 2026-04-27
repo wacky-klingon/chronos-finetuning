@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -265,6 +266,59 @@ def _find_exportable_tokenizer(root: Any) -> Any | None:
     return None
 
 
+def _load_best_trainer_model(predictor: TimeSeriesPredictor) -> Any | None:
+    learner = getattr(predictor, "_learner", None)
+    if learner is None:
+        return None
+    trainer = getattr(learner, "trainer", None)
+    if trainer is None:
+        return None
+
+    model_name = getattr(trainer, "model_best", None) or getattr(trainer, "_model_best", None)
+    if model_name is None and hasattr(trainer, "get_model_best"):
+        try:
+            model_name = trainer.get_model_best()
+        except Exception:
+            model_name = None
+    if model_name is None or not hasattr(trainer, "load_model"):
+        return None
+
+    try:
+        return trainer.load_model(model_name)
+    except Exception:
+        return None
+
+
+def _has_offline_chronos_artifacts(model_dir: Path) -> bool:
+    config_path = model_dir / "config.json"
+    if not config_path.exists():
+        return False
+    safetensor_files = list(model_dir.glob("*.safetensors"))
+    return len(safetensor_files) > 0
+
+
+def _find_finetuned_checkpoint_dir(predictor_dir: Path) -> Path | None:
+    candidates = [
+        path
+        for path in predictor_dir.rglob("*")
+        if path.is_dir() and "fine-tuned-ckpt" in path.name.lower()
+    ]
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    for candidate in candidates:
+        if _has_offline_chronos_artifacts(candidate):
+            return candidate
+    return None
+
+
+def _copy_directory_contents(source_dir: Path, target_dir: Path) -> None:
+    for child in source_dir.iterdir():
+        destination = target_dir / child.name
+        if child.is_dir():
+            shutil.copytree(child, destination, dirs_exist_ok=True)
+        else:
+            shutil.copy2(child, destination)
+
+
 def export_finetuned_safetensors(predictor_dir: Path, export_dir: Path) -> dict[str, Any]:
     export_dir.mkdir(parents=True, exist_ok=True)
     predictor = TimeSeriesPredictor.load(str(predictor_dir))
@@ -275,17 +329,41 @@ def export_finetuned_safetensors(predictor_dir: Path, export_dir: Path) -> dict[
         "exported_model_class": None,
     }
 
-    model_obj = _find_exportable_model(predictor)
+    loaded_best_model = _load_best_trainer_model(predictor)
+    model_obj = None
+    if loaded_best_model is not None:
+        model_obj = _find_exportable_model(loaded_best_model)
     if model_obj is None:
-        export_result["message"] = (
-            "Unable to locate an exportable Hugging Face model object from AutoGluon "
-            "predictor internals. This AutoGluon/Chronos version may not expose a "
-            "direct save_pretrained-compatible module."
-        )
+        model_obj = _find_exportable_model(predictor)
+
+    if model_obj is None:
+        checkpoint_dir = _find_finetuned_checkpoint_dir(predictor_dir)
+        if checkpoint_dir is None:
+            export_result["message"] = (
+                "Unable to locate an exportable Hugging Face model object from AutoGluon "
+                "predictor internals, and no fine-tuned checkpoint directory containing "
+                "offline Chronos artifacts was found under the predictor bundle."
+            )
+        else:
+            _copy_directory_contents(checkpoint_dir, export_dir)
+            export_result["success"] = True
+            export_result["message"] = (
+                "Copied offline Chronos artifacts from fine-tuned checkpoint directory: "
+                f"{checkpoint_dir}"
+            )
+            export_result["exported_model_class"] = "checkpoint_copy_fallback"
     else:
         try:
-            model_obj.save_pretrained(str(export_dir), safe_serialization=True)
-            tokenizer_or_processor = _find_exportable_tokenizer(predictor)
+            try:
+                model_obj.save_pretrained(str(export_dir), safe_serialization=True)
+            except TypeError:
+                model_obj.save_pretrained(str(export_dir))
+
+            tokenizer_or_processor = None
+            if loaded_best_model is not None:
+                tokenizer_or_processor = _find_exportable_tokenizer(loaded_best_model)
+            if tokenizer_or_processor is None:
+                tokenizer_or_processor = _find_exportable_tokenizer(predictor)
             if tokenizer_or_processor is not None:
                 tokenizer_or_processor.save_pretrained(str(export_dir))
             export_result["success"] = True

@@ -4,6 +4,7 @@ Chronos Fine-Tuning is config-driven. Runtime behavior is controlled by:
 
 - `config/model_download.yaml`
 - `config/fine_tune.yaml`
+- `config/model_compare.yaml`
 
 ## `config/model_download.yaml`
 
@@ -86,3 +87,48 @@ Fields:
 - Relative paths are resolved from the repository root.
 - Absolute paths are accepted and used directly.
 - Keep paths in YAML rather than hardcoding values in Python code.
+
+## `config/model_compare.yaml`
+
+Example:
+
+```yaml
+query_data:
+  history_csv: "./data/train.csv"
+  targets_csv: "./data/val.csv"
+  item_id_column: "item_id"
+  timestamp_column: "timestamp"
+  target_column: "target"
+
+sampling:
+  temperature: 1.0
+  top_p: 0.9
+  num_samples: 100
+  seed: 42
+  lower_quantile_column: "0.1"
+  median_quantile_column: "0.5"
+  upper_quantile_column: "0.9"
+
+models:
+  base_predictor_dir: "./artifacts/base-models/chronos-bolt-base"
+  finetuned_predictor_dir: "./artifacts/final_safetensors"
+
+output:
+  output_root: "./outputs/model_compare"
+  run_label: "chronos_bolt"
+```
+
+Fields:
+
+- `query_data.*`: Query history and target datasets plus required column mapping.
+- `sampling.temperature`: Recorded sampling temperature metadata for the run.
+- `sampling.top_p`: Recorded nucleus sampling metadata for the run.
+- `sampling.num_samples`: Recorded sampling count metadata for the run.
+- `sampling.seed`: Sampling seed metadata for reproducibility.
+- `sampling.lower_quantile_column`: Forecast quantile column used for uncertainty lower bound.
+- `sampling.median_quantile_column`: Forecast quantile column reserved for median output tracking.
+- `sampling.upper_quantile_column`: Forecast quantile column used for uncertainty upper bound.
+- `models.base_predictor_dir`: Base offline model directory containing `config.json` and `model.safetensors`.
+- `models.finetuned_predictor_dir`: Fine-tuned offline model directory containing `config.json` and `model.safetensors`.
+- `output.output_root`: Root directory for generated comparison runs.
+- `output.run_label`: Label appended to auto-generated run id.
