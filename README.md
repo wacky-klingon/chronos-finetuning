@@ -2,8 +2,6 @@
 
 Download the Chronos Bolt forecasting model, fine-tune it on your own time-series data, and save a fully self-contained offline model for local inference.
 
----
-
 ## Features
 
 - Download Chronos Bolt base model
@@ -14,7 +12,6 @@ Download the Chronos Bolt forecasting model, fine-tune it on your own time-serie
 - Simple CLI tools
 - Secure private deployment for air-gapped environments
 
----
 
 ## Use Cases
 
@@ -24,8 +21,6 @@ Download the Chronos Bolt forecasting model, fine-tune it on your own time-serie
 - Sensor monitoring
 - Financial trend analysis
 - Research experiments
-
----
 
 ## Project Structure
 
