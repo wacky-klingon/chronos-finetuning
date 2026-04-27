@@ -8,6 +8,7 @@ __pycache__/
 # Project specific folder to ignore
 artifacts/
 output/
+ignonreme/
 # Distribution / packaging
 .Python
 build/

@@ -1,23 +1,43 @@
 query_data:
-  history_csv: "./data/train.csv"
-  targets_csv: "./data/val.csv"
-  item_id_column: "item_id"
-  timestamp_column: "timestamp"
-  target_column: "target"
+  history_parquet: "./data/time_series/airline_passengers_data.parquet"
+  targets_parquet: "./data/time_series/airline_passengers_eval.parquet"
+
+schema:
+  use_parquet_metadata: true
+  json_schema_path: null
+  role_hints:
+    item_id_column: "item_id"
+    timestamp_column: "timestamp"
+    target_column: "target"
+    known_covariate_columns: []
+    past_covariate_columns: []
+    static_covariate_columns: []
 
 sampling:
   temperature: 1.0
   top_p: 0.9
   num_samples: 100
   seed: 42
-  lower_quantile_column: "0.1"
-  median_quantile_column: "0.5"
-  upper_quantile_column: "0.9"
+  prediction_length: 12
+  lower_quantile: 0.1
+  median_quantile: 0.5
+  upper_quantile: 0.9
 
 models:
-  base_predictor_dir: "./artifacts/base-models/chronos-bolt-base"
-  finetuned_predictor_dir: "./artifacts/final_safetensors"
+  base_model_dir: "./artifacts/base-models/chronos-bolt-base"
+  finetuned_model_dir: "./artifacts/final_safetensors"
+  device: "cpu"
 
 output:
   output_root: "./outputs/model_compare"
   run_label: "chronos_bolt"
+
+analysis_hooks:
+  enabled: false
+  provider: "none"
+  codex:
+    api_base: "https://api.openai.com/v1"
+    model: "gpt-4o-mini"
+    api_key_env: "OPENAI_API_KEY"
+    max_output_tokens: 2000
+    request_timeout_seconds: 60

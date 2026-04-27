@@ -2,7 +2,14 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: scripts/model_compare.sh [--config <path>] [--run-id <id>] [--resume] [--force]"
+  echo "Usage: scripts/model_compare.sh [options]"
+  echo "  --config <path>        Path to model_compare.yaml (default: config/model_compare.yaml)"
+  echo "  --run-id <id>          Override auto-generated run id"
+  echo "  --resume               Reuse existing run artifacts when available"
+  echo "  --force                Delete existing run directory before starting"
+  echo "  --skip-hooks           Skip analysis hook step entirely"
+  echo "  --skip-direct-call     Run hooks but only emit prompt-export artifacts"
+  echo "  --schema-path <path>   Override schema.json_schema_path for the run"
   exit 1
 }
 
@@ -10,6 +17,9 @@ CONFIG_PATH="config/model_compare.yaml"
 RUN_ID=""
 RESUME="false"
 FORCE="false"
+SKIP_HOOKS="false"
+SKIP_DIRECT_CALL="false"
+SCHEMA_PATH_OVERRIDE=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PYTHON_CMD=(poetry run python)
@@ -38,6 +48,18 @@ while [[ $# -gt 0 ]]; do
       FORCE="true"
       shift
       ;;
+    --skip-hooks)
+      SKIP_HOOKS="true"
+      shift
+      ;;
+    --skip-direct-call)
+      SKIP_DIRECT_CALL="true"
+      shift
+      ;;
+    --schema-path)
+      SCHEMA_PATH_OVERRIDE="$2"
+      shift 2
+      ;;
     *)
       usage
       ;;
@@ -56,6 +78,10 @@ fi
 
 export PYTHONPATH="${PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
+if [[ -n "$SCHEMA_PATH_OVERRIDE" ]]; then
+  export TACHYON_SCHEMA_PATH_OVERRIDE="$SCHEMA_PATH_OVERRIDE"
+fi
+
 CONFIG_ABS="$("${PYTHON_CMD[@]}" -c "from pathlib import Path; print(Path('$CONFIG_PATH').resolve())")"
 PROJECT_ROOT="$("${PYTHON_CMD[@]}" -c "from pathlib import Path; p=Path('$CONFIG_ABS').resolve(); print(p.parent.parent)")"
 
@@ -68,57 +94,65 @@ if ! "${PYTHON_CMD[@]}" -c "import tachyon_model_downloader" >/dev/null 2>&1; th
 fi
 
 readarray -t CONFIG_VALUES < <(
-  "${PYTHON_CMD[@]}" -c "from pathlib import Path; from tachyon_model_downloader.model_compare_schemas import load_model_compare_config, resolve_path; cfg=load_model_compare_config(Path('$CONFIG_ABS')); root=Path('$PROJECT_ROOT'); print(resolve_path(root, cfg.output.output_root)); print(cfg.output.run_label); print(resolve_path(root, cfg.models.base_predictor_dir)); print(resolve_path(root, cfg.models.finetuned_predictor_dir)); print(resolve_path(root, cfg.query_data.history_csv)); print(resolve_path(root, cfg.query_data.targets_csv))"
+  "${PYTHON_CMD[@]}" -c "from pathlib import Path; from tachyon_model_downloader.model_compare_schemas import load_model_compare_config, resolve_path; cfg=load_model_compare_config(Path('$CONFIG_ABS')); root=Path('$PROJECT_ROOT'); print(resolve_path(root, cfg.output.output_root)); print(cfg.output.run_label); print(resolve_path(root, cfg.models.base_model_dir)); print(resolve_path(root, cfg.models.finetuned_model_dir)); print(resolve_path(root, cfg.query_data.history_parquet)); print(resolve_path(root, cfg.query_data.targets_parquet)); print('1' if cfg.analysis_hooks.enabled else '0')"
 )
 
-if [[ "${#CONFIG_VALUES[@]}" -lt 6 ]]; then
+if [[ "${#CONFIG_VALUES[@]}" -lt 7 ]]; then
   echo "Failed to parse config values from: $CONFIG_ABS"
   exit 8
 fi
 
 OUTPUT_ROOT="${CONFIG_VALUES[0]}"
 RUN_LABEL="${CONFIG_VALUES[1]}"
-BASE_PREDICTOR_DIR="${CONFIG_VALUES[2]}"
-FINETUNED_PREDICTOR_DIR="${CONFIG_VALUES[3]}"
-HISTORY_CSV="${CONFIG_VALUES[4]}"
-TARGETS_CSV="${CONFIG_VALUES[5]}"
+BASE_MODEL_DIR="${CONFIG_VALUES[2]}"
+FINETUNED_MODEL_DIR="${CONFIG_VALUES[3]}"
+HISTORY_PARQUET="${CONFIG_VALUES[4]}"
+TARGETS_PARQUET="${CONFIG_VALUES[5]}"
+HOOKS_ENABLED="${CONFIG_VALUES[6]}"
 
-if [[ ! -d "$BASE_PREDICTOR_DIR" ]]; then
-  echo "Config validation failed: base model directory does not exist."
-  echo "Expected path: $BASE_PREDICTOR_DIR"
-  echo "Update models.base_predictor_dir in: $CONFIG_ABS"
-  exit 10
-fi
-if [[ ! -f "${BASE_PREDICTOR_DIR}/config.json" || ! -f "${BASE_PREDICTOR_DIR}/model.safetensors" ]]; then
-  echo "Config validation failed: base model directory is missing offline artifacts."
-  echo "Required files: ${BASE_PREDICTOR_DIR}/config.json and ${BASE_PREDICTOR_DIR}/model.safetensors"
-  echo "Update models.base_predictor_dir in: $CONFIG_ABS"
-  exit 10
-fi
-if [[ ! -d "$FINETUNED_PREDICTOR_DIR" ]]; then
-  echo "Config validation failed: fine-tuned model directory does not exist."
-  echo "Expected path: $FINETUNED_PREDICTOR_DIR"
-  echo "Update models.finetuned_predictor_dir in: $CONFIG_ABS"
-  exit 11
-fi
-if [[ ! -f "${FINETUNED_PREDICTOR_DIR}/config.json" || ! -f "${FINETUNED_PREDICTOR_DIR}/model.safetensors" ]]; then
-  echo "Config validation failed: fine-tuned model directory is missing offline artifacts."
-  echo "Required files: ${FINETUNED_PREDICTOR_DIR}/config.json and ${FINETUNED_PREDICTOR_DIR}/model.safetensors"
-  echo "Update models.finetuned_predictor_dir in: $CONFIG_ABS"
-  exit 11
-fi
-if [[ ! -f "$HISTORY_CSV" ]]; then
-  echo "Config validation failed: history CSV does not exist."
-  echo "Expected path: $HISTORY_CSV"
-  echo "Update query_data.history_csv in: $CONFIG_ABS"
-  exit 12
-fi
-if [[ ! -f "$TARGETS_CSV" ]]; then
-  echo "Config validation failed: targets CSV does not exist."
-  echo "Expected path: $TARGETS_CSV"
-  echo "Update query_data.targets_csv in: $CONFIG_ABS"
-  exit 13
-fi
+validate_safetensors_only() {
+  local label="$1"
+  local dir="$2"
+  if [[ ! -d "$dir" ]]; then
+    echo "Config validation failed: ${label} model directory does not exist."
+    echo "Expected path: $dir"
+    exit 10
+  fi
+  if [[ ! -f "${dir}/config.json" || ! -f "${dir}/model.safetensors" ]]; then
+    echo "Config validation failed: ${label} model directory missing required safetensors artifacts."
+    echo "Required files: ${dir}/config.json and ${dir}/model.safetensors"
+    exit 10
+  fi
+  if find "$dir" -type f \( -iname '*.pkl' -o -iname '*.pickle' -o -iname '*.bin' \) | read -r _; then
+    echo "Config validation failed: ${label} model directory contains pickle-based artifacts."
+    echo "The safetensors-only offline mode does not allow .pkl, .pickle, or .bin files."
+    echo "Offending directory: $dir"
+    exit 10
+  fi
+}
+
+validate_parquet() {
+  local label="$1"
+  local path="$2"
+  if [[ ! -f "$path" ]]; then
+    echo "Config validation failed: ${label} parquet file does not exist."
+    echo "Expected path: $path"
+    exit 12
+  fi
+  case "${path,,}" in
+    *.parquet) ;;
+    *)
+      echo "Config validation failed: ${label} input must have a .parquet extension."
+      echo "Got: $path"
+      exit 12
+      ;;
+  esac
+}
+
+validate_safetensors_only "base" "$BASE_MODEL_DIR"
+validate_safetensors_only "fine-tuned" "$FINETUNED_MODEL_DIR"
+validate_parquet "history" "$HISTORY_PARQUET"
+validate_parquet "targets" "$TARGETS_PARQUET"
 
 if [[ -z "$RUN_ID" ]]; then
   RUN_ID="$("${PYTHON_CMD[@]}" -c "from datetime import datetime, timezone; print(datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ'))")_${RUN_LABEL}"
@@ -130,6 +164,7 @@ BASE_OUTPUT="${RUN_DIR}/base_predictions.jsonl"
 FINETUNED_OUTPUT="${RUN_DIR}/finetuned_predictions.jsonl"
 COMPARISON_JSON="${RUN_DIR}/comparison.json"
 COMPARISON_MD="${RUN_DIR}/comparison.md"
+HOOKS_DIR="${RUN_DIR}/analysis"
 LOCK_FILE="${RUN_DIR}/.lock"
 
 if [[ "$FORCE" == "true" && -d "$RUN_DIR" ]]; then
@@ -216,8 +251,28 @@ else
     --output-markdown "$COMPARISON_MD"
 fi
 
+if [[ "$SKIP_HOOKS" == "true" ]]; then
+  step_log "Skipping analysis hook step (--skip-hooks)."
+else
+  HOOK_ARGS=("${PYTHON_CMD[@]}" -m tachyon_model_downloader.analysis_hooks
+    --config "$CONFIG_ABS"
+    --comparison-json "$COMPARISON_JSON"
+    --output-dir "$HOOKS_DIR")
+  if [[ "$SKIP_DIRECT_CALL" == "true" ]]; then
+    HOOK_ARGS+=(--skip-direct-call)
+  fi
+  if [[ "$RESUME" == "true" && -s "${HOOKS_DIR}/analysis_payload.json" && -s "${HOOKS_DIR}/analysis_prompt.md" ]]; then
+    step_log "Resume mode: skipping analysis hook step."
+  else
+    run_step "analysis hooks" "${LOG_DIR}/analysis_hooks.log" "${HOOK_ARGS[@]}"
+  fi
+fi
+
 step_log "Completed run."
 step_log "Base predictions: $BASE_OUTPUT"
 step_log "Fine-tuned predictions: $FINETUNED_OUTPUT"
 step_log "Comparison JSON: $COMPARISON_JSON"
 step_log "Comparison markdown: $COMPARISON_MD"
+if [[ "$SKIP_HOOKS" != "true" ]]; then
+  step_log "Analysis artifacts: $HOOKS_DIR"
+fi

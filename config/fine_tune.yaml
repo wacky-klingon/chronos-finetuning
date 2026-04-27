@@ -1,9 +1,17 @@
 data:
-  train_csv: "./data/train.csv"
-  val_csv: "./data/val.csv"
-  item_id_column: "item_id"
-  timestamp_column: "timestamp"
-  target_column: "target"
+  train_parquet: "./data/time_series/airline_passengers_data.parquet"
+  val_parquet: "./data/time_series/airline_passengers_eval.parquet"
+
+schema:
+  use_parquet_metadata: true
+  json_schema_path: null
+  role_hints:
+    item_id_column: "item_id"
+    timestamp_column: "timestamp"
+    target_column: "target"
+    known_covariate_columns: []
+    past_covariate_columns: []
+    static_covariate_columns: []
 
 training:
   prediction_length: 12

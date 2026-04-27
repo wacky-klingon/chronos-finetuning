@@ -6,32 +6,21 @@ Chronos artifacts.
 ## Prerequisites
 
 - Python `>=3.10,<3.13`
-- `pip`
+- Poetry
 - Internet access for initial Hugging Face model download
 - Sufficient disk space for model artifacts and training outputs
 
 ## Install
 
-PowerShell:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -e .
-```
-
-Bash:
-
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
+poetry lock
+poetry install
 ```
 
 ## Step 1: Download the Chronos base model
 
 ```bash
-python -m tachyon_model_downloader.download_model --config config/model_download.yaml
+poetry run python -m tachyon_model_downloader.download_model --config config/model_download.yaml
 ```
 
 Expected output path:
@@ -45,7 +34,7 @@ Run state file:
 ## Step 2: Fine-tune and export
 
 ```bash
-python -m tachyon_model_downloader.fine_tune_and_export
+poetry run python -m tachyon_model_downloader.fine_tune_and_export --config config/fine_tune.yaml
 ```
 
 Expected output paths:
@@ -67,8 +56,8 @@ Expected output paths:
 - Missing base model directory:
   - Ensure `training.chronos_model_path` in `config/fine_tune.yaml` points to the
     downloaded model path.
-- CSV schema mismatch:
-  - Ensure train and validation files contain `item_id`, `timestamp`, and `target`
+- Parquet schema mismatch:
+  - Ensure train and validation parquet files contain `item_id`, `timestamp`, and `target`
     (or update config field names).
 - Slow CPU training:
   - Lower `training.max_epochs` or `training.fine_tune_steps` for validation runs.

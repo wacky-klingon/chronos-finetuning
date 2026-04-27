@@ -1,25 +1,38 @@
+"""Fine-tune a Chronos model with AutoGluon and export safetensors-only artifacts.
+
+Inputs are parquet files; dataset roles are resolved using the shared schema
+source. The exported model directory is validated to comply with the
+safetensors-only offline mode policy.
+"""
+
 from __future__ import annotations
 
+import argparse
 import json
 import shutil
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any
 
 import pandas as pd
 import yaml
 from autogluon.timeseries import TimeSeriesDataFrame, TimeSeriesPredictor
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+from .dataset_schema import DatasetRoles, SchemaSourceConfig, resolve_dataset_roles
+from .model_validation import (
+    FORBIDDEN_ARTIFACT_SUFFIXES,
+    REQUIRED_MODEL_FILES,
+    validate_safetensors_only_model_dir,
+)
+from .parquet_loader import load_dataset_with_roles
 
 
 class DataConfig(BaseModel):
-    train_csv: str = Field(min_length=1)
-    val_csv: str = Field(min_length=1)
-    item_id_column: str = Field(min_length=1)
-    timestamp_column: str = Field(min_length=1)
-    target_column: str = Field(min_length=1)
+    train_parquet: str = Field(min_length=1)
+    val_parquet: str = Field(min_length=1)
 
 
 class TrainingConfig(BaseModel):
@@ -43,9 +56,12 @@ class PathConfig(BaseModel):
 
 
 class FineTuneConfig(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     data: DataConfig
     training: TrainingConfig
     paths: PathConfig
+    schema_source: SchemaSourceConfig = Field(alias="schema")
 
 
 class ExportState(BaseModel):
@@ -66,6 +82,7 @@ class ExportState(BaseModel):
     fine_tune_batch_size: int
     export_success: bool
     export_message: str
+    export_safetensors_compliant: bool
 
 
 class MetricsReport(BaseModel):
@@ -84,6 +101,20 @@ class MetricsReport(BaseModel):
     exported_model_safetensors_exists: bool
     export_success: bool
     export_message: str
+    export_safetensors_compliant: bool
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Fine-tune a Chronos model with AutoGluon and export safetensors artifacts."
+    )
+    parser.add_argument(
+        "--config",
+        required=False,
+        default=None,
+        help="Path to fine_tune YAML config (default: config/fine_tune.yaml).",
+    )
+    return parser.parse_args()
 
 
 def load_config(config_path: Path) -> FineTuneConfig:
@@ -102,54 +133,23 @@ def resolve_path(project_root: Path, relative_or_abs: str) -> Path:
 
 
 def load_training_data(
-    config: FineTuneConfig, project_root: Path
+    config: FineTuneConfig, project_root: Path, roles: DatasetRoles
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    train_csv = resolve_path(project_root, config.data.train_csv)
-    val_csv = resolve_path(project_root, config.data.val_csv)
-
-    if not train_csv.exists():
-        raise FileNotFoundError(f"Training CSV not found: {train_csv}")
-    if not val_csv.exists():
-        raise FileNotFoundError(f"Validation CSV not found: {val_csv}")
-
-    train_df = pd.read_csv(train_csv)
-    val_df = pd.read_csv(val_csv)
-
-    required_columns = {
-        config.data.item_id_column,
-        config.data.timestamp_column,
-        config.data.target_column,
-    }
-    missing_train = required_columns.difference(train_df.columns)
-    missing_val = required_columns.difference(val_df.columns)
-    if missing_train:
-        raise ValueError(f"Training CSV missing required columns: {sorted(missing_train)}")
-    if missing_val:
-        raise ValueError(f"Validation CSV missing required columns: {sorted(missing_val)}")
-
-    train_df[config.data.timestamp_column] = pd.to_datetime(
-        train_df[config.data.timestamp_column], errors="raise"
+    train_path = resolve_path(project_root, config.data.train_parquet)
+    val_path = resolve_path(project_root, config.data.val_parquet)
+    train_df = load_dataset_with_roles(
+        parquet_path=train_path, roles=roles, source_label="training"
     )
-    val_df[config.data.timestamp_column] = pd.to_datetime(
-        val_df[config.data.timestamp_column], errors="raise"
-    )
-
+    val_df = load_dataset_with_roles(parquet_path=val_path, roles=roles, source_label="validation")
     return train_df, val_df
 
 
-def to_timeseries_dataframe(config: FineTuneConfig, frame: pd.DataFrame) -> TimeSeriesDataFrame:
-    subset = frame[
-        [
-            config.data.item_id_column,
-            config.data.timestamp_column,
-            config.data.target_column,
-        ]
-    ].copy()
-
+def to_timeseries_dataframe(roles: DatasetRoles, frame: pd.DataFrame) -> TimeSeriesDataFrame:
+    subset = frame[[roles.item_id_column, roles.timestamp_column, roles.target_column]].copy()
     return TimeSeriesDataFrame.from_data_frame(
         subset,
-        id_column=config.data.item_id_column,
-        timestamp_column=config.data.timestamp_column,
+        id_column=roles.item_id_column,
+        timestamp_column=roles.timestamp_column,
     )
 
 
@@ -189,7 +189,6 @@ def _iter_objects_for_export(root: Any) -> list[Any]:
         visited.add(current_id)
         discovered.append(current)
 
-        # Traverse common object containers first.
         if isinstance(current, dict):
             queue.extend(current.values())
             continue
@@ -197,7 +196,6 @@ def _iter_objects_for_export(root: Any) -> list[Any]:
             queue.extend(current)
             continue
 
-        # Traverse likely internal model attributes.
         for attr_name in (
             "model",
             "_model",
@@ -266,86 +264,60 @@ def _find_exportable_tokenizer(root: Any) -> Any | None:
     return None
 
 
-def _load_best_trainer_model(predictor: TimeSeriesPredictor) -> Any | None:
-    learner = getattr(predictor, "_learner", None)
-    if learner is None:
-        return None
-    trainer = getattr(learner, "trainer", None)
-    if trainer is None:
-        return None
-
-    model_name = getattr(trainer, "model_best", None) or getattr(trainer, "_model_best", None)
-    if model_name is None and hasattr(trainer, "get_model_best"):
-        try:
-            model_name = trainer.get_model_best()
-        except Exception:
-            model_name = None
-    if model_name is None or not hasattr(trainer, "load_model"):
-        return None
-
-    try:
-        return trainer.load_model(model_name)
-    except Exception:
-        return None
-
-
-def _has_offline_chronos_artifacts(model_dir: Path) -> bool:
-    config_path = model_dir / "config.json"
-    if not config_path.exists():
-        return False
-    safetensor_files = list(model_dir.glob("*.safetensors"))
-    return len(safetensor_files) > 0
+def _purge_forbidden_artifacts(export_dir: Path) -> list[Path]:
+    """Remove any pickle-based artifacts produced during export."""
+    purged: list[Path] = []
+    for path in export_dir.rglob("*"):
+        if path.is_file() and path.suffix.lower() in FORBIDDEN_ARTIFACT_SUFFIXES:
+            purged.append(path)
+            path.unlink()
+    return purged
 
 
 def _find_finetuned_checkpoint_dir(predictor_dir: Path) -> Path | None:
-    candidates = [
-        path
-        for path in predictor_dir.rglob("*")
-        if path.is_dir() and "fine-tuned-ckpt" in path.name.lower()
-    ]
-    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    for candidate in candidates:
-        if _has_offline_chronos_artifacts(candidate):
-            return candidate
-    return None
-
-
-def _copy_verify_and_delete_source(source_dir: Path, target_dir: Path) -> tuple[int, int]:
-    source_files = [path for path in source_dir.rglob("*") if path.is_file()]
-    copied_files: list[tuple[Path, Path]] = []
-    total_verified_bytes = 0
-
-    for source_path in source_files:
-        relative_path = source_path.relative_to(source_dir)
-        target_path = target_dir / relative_path
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_path, target_path)
-
-        source_size = source_path.stat().st_size
-        target_size = target_path.stat().st_size
-        if source_size != target_size:
-            raise RuntimeError(
-                f"Size mismatch after copy for {relative_path}: source={source_size}, target={target_size}"
-            )
-        copied_files.append((source_path, target_path))
-        total_verified_bytes += source_size
-
-    for source_path, _ in copied_files:
-        source_path.unlink()
-
-    source_dirs = [path for path in source_dir.rglob("*") if path.is_dir()]
-    source_dirs.sort(key=lambda path: len(path.parts), reverse=True)
-    for directory in source_dirs:
-        try:
-            directory.rmdir()
-        except OSError:
+    models_dir = predictor_dir / "models"
+    if not models_dir.exists() or not models_dir.is_dir():
+        return None
+    candidates: list[Path] = []
+    for candidate in models_dir.rglob("fine-tuned-ckpt"):
+        if not candidate.is_dir():
             continue
-    try:
-        source_dir.rmdir()
-    except OSError:
-        pass
+        config_path = candidate / "config.json"
+        safetensors_path = candidate / "model.safetensors"
+        if config_path.exists() and safetensors_path.exists():
+            candidates.append(candidate)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return candidates[0]
 
-    return len(copied_files), total_verified_bytes
+
+def _copy_checkpoint_fallback(
+    predictor_dir: Path, export_dir: Path
+) -> tuple[bool, str, str | None]:
+    checkpoint_dir = _find_finetuned_checkpoint_dir(predictor_dir=predictor_dir)
+    if checkpoint_dir is None:
+        return (
+            False,
+            "Unable to locate an exportable model object and no fine-tuned checkpoint "
+            "directory with config.json + model.safetensors was found under predictor models.",
+            None,
+        )
+
+    source_config = checkpoint_dir / "config.json"
+    source_safetensors = checkpoint_dir / "model.safetensors"
+    target_config = export_dir / "config.json"
+    target_safetensors = export_dir / "model.safetensors"
+
+    # Buffer cross-filesystem handle visibility (WSL to Windows mount transitions).
+    sleep(0.5)
+    shutil.copy2(source_config, target_config)
+    shutil.copy2(source_safetensors, target_safetensors)
+    return (
+        True,
+        f"Copied fine-tuned checkpoint artifacts from {checkpoint_dir} after 500ms delay.",
+        checkpoint_dir.name,
+    )
 
 
 def export_finetuned_safetensors(predictor_dir: Path, export_dir: Path) -> dict[str, Any]:
@@ -356,60 +328,57 @@ def export_finetuned_safetensors(predictor_dir: Path, export_dir: Path) -> dict[
         "success": False,
         "message": "",
         "exported_model_class": None,
+        "safetensors_compliant": False,
+        "purged_pickle_artifacts": [],
     }
 
-    loaded_best_model = _load_best_trainer_model(predictor)
-    model_obj = None
-    if loaded_best_model is not None:
-        model_obj = _find_exportable_model(loaded_best_model)
+    model_obj = _find_exportable_model(predictor)
     if model_obj is None:
-        model_obj = _find_exportable_model(predictor)
-
-    if model_obj is None:
-        checkpoint_dir = _find_finetuned_checkpoint_dir(predictor_dir)
-        if checkpoint_dir is None:
-            if _has_offline_chronos_artifacts(export_dir):
-                export_result["success"] = True
-                export_result["message"] = (
-                    "Export artifacts already exist in target directory and no source "
-                    "checkpoint was found. Reusing existing export."
-                )
-                export_result["exported_model_class"] = "existing_export_reused"
-            else:
-                export_result["message"] = (
-                    "Unable to locate an exportable Hugging Face model object from AutoGluon "
-                    "predictor internals, and no fine-tuned checkpoint directory containing "
-                    "offline Chronos artifacts was found under the predictor bundle."
-                )
-        else:
-            copied_files_count, verified_bytes = _copy_verify_and_delete_source(
-                source_dir=checkpoint_dir, target_dir=export_dir
-            )
-            export_result["success"] = True
-            export_result["message"] = (
-                "Copied and verified offline Chronos artifacts, then deleted source checkpoint files. "
-                f"source={checkpoint_dir}, files={copied_files_count}, bytes={verified_bytes}"
-            )
-            export_result["exported_model_class"] = "checkpoint_copy_verify_delete"
+        fallback_success, fallback_message, fallback_source_label = _copy_checkpoint_fallback(
+            predictor_dir=predictor_dir, export_dir=export_dir
+        )
+        export_result["success"] = fallback_success
+        export_result["message"] = fallback_message
+        if fallback_source_label is not None:
+            export_result["exported_model_class"] = fallback_source_label
     else:
         try:
-            try:
-                model_obj.save_pretrained(str(export_dir), safe_serialization=True)
-            except TypeError:
-                model_obj.save_pretrained(str(export_dir))
-
-            tokenizer_or_processor = None
-            if loaded_best_model is not None:
-                tokenizer_or_processor = _find_exportable_tokenizer(loaded_best_model)
-            if tokenizer_or_processor is None:
-                tokenizer_or_processor = _find_exportable_tokenizer(predictor)
+            model_obj.save_pretrained(str(export_dir), safe_serialization=True)
+            tokenizer_or_processor = _find_exportable_tokenizer(predictor)
             if tokenizer_or_processor is not None:
                 tokenizer_or_processor.save_pretrained(str(export_dir))
             export_result["success"] = True
             export_result["message"] = "Exported model and tokenizer/processor artifacts."
             export_result["exported_model_class"] = type(model_obj).__name__
         except Exception as export_exc:
-            export_result["message"] = f"Export failed while calling save_pretrained: {export_exc}"
+            fallback_success, fallback_message, fallback_source_label = _copy_checkpoint_fallback(
+                predictor_dir=predictor_dir, export_dir=export_dir
+            )
+            export_result["success"] = fallback_success
+            if fallback_success:
+                export_result["message"] = (
+                    "save_pretrained failed; fallback copy succeeded. "
+                    f"save_pretrained error: {export_exc}. {fallback_message}"
+                )
+                if fallback_source_label is not None:
+                    export_result["exported_model_class"] = fallback_source_label
+            else:
+                export_result["message"] = (
+                    f"Export failed while calling save_pretrained: {export_exc}. "
+                    f"Fallback copy also failed: {fallback_message}"
+                )
+
+    if export_result["success"]:
+        purged = _purge_forbidden_artifacts(export_dir=export_dir)
+        export_result["purged_pickle_artifacts"] = [str(path) for path in purged]
+        try:
+            validate_safetensors_only_model_dir(model_dir=export_dir, role_label="exported")
+            export_result["safetensors_compliant"] = True
+        except (FileNotFoundError, NotADirectoryError, ValueError) as validation_exc:
+            export_result["safetensors_compliant"] = False
+            export_result["message"] = (
+                f"Export wrote files but failed safetensors-only validation: {validation_exc}"
+            )
 
     export_manifest = {
         "exported_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -418,6 +387,10 @@ def export_finetuned_safetensors(predictor_dir: Path, export_dir: Path) -> dict[
         "export_success": export_result["success"],
         "export_message": export_result["message"],
         "exported_model_class": export_result["exported_model_class"],
+        "safetensors_compliant": export_result["safetensors_compliant"],
+        "required_files": list(REQUIRED_MODEL_FILES),
+        "forbidden_suffixes": list(FORBIDDEN_ARTIFACT_SUFFIXES),
+        "purged_pickle_artifacts": export_result["purged_pickle_artifacts"],
     }
     manifest_path = export_dir / "export_manifest.json"
     with manifest_path.open("w", encoding="utf-8") as file_handle:
@@ -444,6 +417,7 @@ def write_metrics_report(
     export_seconds: float,
     export_success: bool,
     export_message: str,
+    export_safetensors_compliant: bool,
 ) -> None:
     predictor_file_count, predictor_total_bytes = compute_directory_metrics(predictor_dir)
     export_file_count, export_total_bytes = compute_directory_metrics(export_dir)
@@ -465,6 +439,7 @@ def write_metrics_report(
         exported_model_safetensors_exists=model_safetensors_path.exists(),
         export_success=export_success,
         export_message=export_message,
+        export_safetensors_compliant=export_safetensors_compliant,
     )
 
     with report_path.open("w", encoding="utf-8") as file_handle:
@@ -477,6 +452,7 @@ def write_export_state(
     export_dir: Path,
     export_success: bool,
     export_message: str,
+    export_safetensors_compliant: bool,
 ) -> None:
     state = ExportState(
         created_at_utc=datetime.now(timezone.utc).isoformat(),
@@ -496,6 +472,7 @@ def write_export_state(
         fine_tune_batch_size=config.training.fine_tune_batch_size,
         export_success=export_success,
         export_message=export_message,
+        export_safetensors_compliant=export_safetensors_compliant,
     )
     state_path = predictor_dir / "training_state.json"
     with state_path.open("w", encoding="utf-8") as file_handle:
@@ -510,15 +487,24 @@ def fine_tune_and_export(config: FineTuneConfig, project_root: Path) -> tuple[Pa
     export_dir.mkdir(parents=True, exist_ok=True)
     chronos_model_path = resolve_chronos_model_path(config=config, project_root=project_root)
 
+    train_path = resolve_path(project_root, config.data.train_parquet)
+    train_roles = resolve_dataset_roles(
+        parquet_path=train_path,
+        schema_source=config.schema_source,
+        project_root=project_root,
+    )
+
     data_start = perf_counter()
-    train_df, val_df = load_training_data(config=config, project_root=project_root)
-    train_ts = to_timeseries_dataframe(config=config, frame=train_df)
-    val_ts = to_timeseries_dataframe(config=config, frame=val_df)
+    train_df, val_df = load_training_data(
+        config=config, project_root=project_root, roles=train_roles
+    )
+    train_ts = to_timeseries_dataframe(roles=train_roles, frame=train_df)
+    val_ts = to_timeseries_dataframe(roles=train_roles, frame=val_df)
     data_seconds = perf_counter() - data_start
 
     predictor = TimeSeriesPredictor(
         prediction_length=config.training.prediction_length,
-        target=config.data.target_column,
+        target=train_roles.target_column,
         eval_metric=config.training.eval_metric,
         path=str(predictor_dir),
     )
@@ -555,6 +541,7 @@ def fine_tune_and_export(config: FineTuneConfig, project_root: Path) -> tuple[Pa
         export_dir=export_dir,
         export_success=bool(export_result["success"]),
         export_message=str(export_result["message"]),
+        export_safetensors_compliant=bool(export_result["safetensors_compliant"]),
     )
 
     total_seconds = perf_counter() - run_start
@@ -572,13 +559,18 @@ def fine_tune_and_export(config: FineTuneConfig, project_root: Path) -> tuple[Pa
         export_seconds=export_seconds,
         export_success=bool(export_result["success"]),
         export_message=str(export_result["message"]),
+        export_safetensors_compliant=bool(export_result["safetensors_compliant"]),
     )
     return predictor_dir, export_dir
 
 
 def main() -> None:
+    args = parse_args()
     project_root = Path(__file__).resolve().parents[2]
-    config_path = project_root / "config" / "fine_tune.yaml"
+    if args.config is not None:
+        config_path = Path(args.config).resolve()
+    else:
+        config_path = project_root / "config" / "fine_tune.yaml"
     config = load_config(config_path=config_path)
     predictor_dir, export_dir = fine_tune_and_export(config=config, project_root=project_root)
     print(f"Predictor bundle: {predictor_dir}")
