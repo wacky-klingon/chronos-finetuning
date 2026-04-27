@@ -192,7 +192,7 @@ def _iter_objects_for_export(root: Any) -> list[Any]:
         if isinstance(current, dict):
             queue.extend(current.values())
             continue
-        if isinstance(current, (list, tuple, set)):
+        if isinstance(current, list | tuple | set):
             queue.extend(current)
             continue
 
@@ -292,9 +292,7 @@ def export_finetuned_safetensors(predictor_dir: Path, export_dir: Path) -> dict[
             export_result["message"] = "Exported model and tokenizer/processor artifacts."
             export_result["exported_model_class"] = type(model_obj).__name__
         except Exception as export_exc:
-            export_result["message"] = (
-                f"Export failed while calling save_pretrained: {export_exc}"
-            )
+            export_result["message"] = f"Export failed while calling save_pretrained: {export_exc}"
 
     export_manifest = {
         "exported_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -432,9 +430,7 @@ def fine_tune_and_export(config: FineTuneConfig, project_root: Path) -> tuple[Pa
     training_seconds = perf_counter() - train_start
 
     export_start = perf_counter()
-    export_result = export_finetuned_safetensors(
-        predictor_dir=predictor_dir, export_dir=export_dir
-    )
+    export_result = export_finetuned_safetensors(predictor_dir=predictor_dir, export_dir=export_dir)
     export_seconds = perf_counter() - export_start
     write_export_state(
         config=config,

@@ -88,9 +88,7 @@ def download_from_hf(config: ModelDownloadConfig, project_root: Path) -> Path:
     )
 
     if not _config_json_path(output_dir).exists():
-        raise RuntimeError(
-            "Download completed but config.json was not found in output directory."
-        )
+        raise RuntimeError("Download completed but config.json was not found in output directory.")
 
     _write_state(
         output_dir=output_dir,

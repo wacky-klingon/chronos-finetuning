@@ -54,6 +54,35 @@ python -m tachyon_model_downloader.download_model --config config/model_download
 python -m tachyon_model_downloader.fine_tune_and_export
 ```
 
+## Check-in Hygiene
+
+Install project and development tooling with Poetry:
+
+```bash
+poetry install --with dev
+```
+
+Run local quality checks:
+
+```bash
+poetry run ruff check .
+poetry run ruff format .
+poetry run mypy src
+poetry run bandit -r src
+```
+
+Enable automated checks at commit time:
+
+```bash
+poetry run pre-commit install
+```
+
+Run all configured hooks on demand:
+
+```bash
+poetry run pre-commit run --all-files
+```
+
 ## Typical Outputs
 
 - Base model snapshot: `artifacts/base-models/chronos-bolt-base`
