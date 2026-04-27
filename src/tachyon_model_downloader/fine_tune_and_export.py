@@ -310,13 +310,42 @@ def _find_finetuned_checkpoint_dir(predictor_dir: Path) -> Path | None:
     return None
 
 
-def _copy_directory_contents(source_dir: Path, target_dir: Path) -> None:
-    for child in source_dir.iterdir():
-        destination = target_dir / child.name
-        if child.is_dir():
-            shutil.copytree(child, destination, dirs_exist_ok=True)
-        else:
-            shutil.copy2(child, destination)
+def _copy_verify_and_delete_source(source_dir: Path, target_dir: Path) -> tuple[int, int]:
+    source_files = [path for path in source_dir.rglob("*") if path.is_file()]
+    copied_files: list[tuple[Path, Path]] = []
+    total_verified_bytes = 0
+
+    for source_path in source_files:
+        relative_path = source_path.relative_to(source_dir)
+        target_path = target_dir / relative_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, target_path)
+
+        source_size = source_path.stat().st_size
+        target_size = target_path.stat().st_size
+        if source_size != target_size:
+            raise RuntimeError(
+                f"Size mismatch after copy for {relative_path}: source={source_size}, target={target_size}"
+            )
+        copied_files.append((source_path, target_path))
+        total_verified_bytes += source_size
+
+    for source_path, _ in copied_files:
+        source_path.unlink()
+
+    source_dirs = [path for path in source_dir.rglob("*") if path.is_dir()]
+    source_dirs.sort(key=lambda path: len(path.parts), reverse=True)
+    for directory in source_dirs:
+        try:
+            directory.rmdir()
+        except OSError:
+            continue
+    try:
+        source_dir.rmdir()
+    except OSError:
+        pass
+
+    return len(copied_files), total_verified_bytes
 
 
 def export_finetuned_safetensors(predictor_dir: Path, export_dir: Path) -> dict[str, Any]:
@@ -339,19 +368,29 @@ def export_finetuned_safetensors(predictor_dir: Path, export_dir: Path) -> dict[
     if model_obj is None:
         checkpoint_dir = _find_finetuned_checkpoint_dir(predictor_dir)
         if checkpoint_dir is None:
-            export_result["message"] = (
-                "Unable to locate an exportable Hugging Face model object from AutoGluon "
-                "predictor internals, and no fine-tuned checkpoint directory containing "
-                "offline Chronos artifacts was found under the predictor bundle."
-            )
+            if _has_offline_chronos_artifacts(export_dir):
+                export_result["success"] = True
+                export_result["message"] = (
+                    "Export artifacts already exist in target directory and no source "
+                    "checkpoint was found. Reusing existing export."
+                )
+                export_result["exported_model_class"] = "existing_export_reused"
+            else:
+                export_result["message"] = (
+                    "Unable to locate an exportable Hugging Face model object from AutoGluon "
+                    "predictor internals, and no fine-tuned checkpoint directory containing "
+                    "offline Chronos artifacts was found under the predictor bundle."
+                )
         else:
-            _copy_directory_contents(checkpoint_dir, export_dir)
+            copied_files_count, verified_bytes = _copy_verify_and_delete_source(
+                source_dir=checkpoint_dir, target_dir=export_dir
+            )
             export_result["success"] = True
             export_result["message"] = (
-                "Copied offline Chronos artifacts from fine-tuned checkpoint directory: "
-                f"{checkpoint_dir}"
+                "Copied and verified offline Chronos artifacts, then deleted source checkpoint files. "
+                f"source={checkpoint_dir}, files={copied_files_count}, bytes={verified_bytes}"
             )
-            export_result["exported_model_class"] = "checkpoint_copy_fallback"
+            export_result["exported_model_class"] = "checkpoint_copy_verify_delete"
     else:
         try:
             try:
