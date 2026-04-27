@@ -1,0 +1,24 @@
+data:
+  train_csv: "./data/train.csv"
+  val_csv: "./data/val.csv"
+  item_id_column: "item_id"
+  timestamp_column: "timestamp"
+  target_column: "target"
+
+training:
+  prediction_length: 12
+  eval_metric: "MASE"
+  presets: "medium_quality"
+  chronos_model_path: "./artifacts/base-models/chronos-bolt-base"
+  context_length: 64
+  batch_size: 16
+  max_epochs: 3
+  device: "cpu"
+  fine_tune: true
+  fine_tune_lr: 0.00001
+  fine_tune_steps: 200
+  fine_tune_batch_size: 8
+
+paths:
+  predictor_dir: "./artifacts/ag_predictor"
+  export_dir: "./artifacts/final_safetensors"

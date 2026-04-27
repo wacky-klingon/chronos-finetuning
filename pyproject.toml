@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "tachyon-model"
+version = "0.1.0"
+description = "Config-driven downloader for Chronos base models."
+readme = "README.md"
+packages = [{ include = "tachyon_model_downloader", from = "src" }]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+huggingface_hub = ">=0.24.0"
+pydantic = ">=2.7.0"
+pyyaml = ">=6.0.0"
+autogluon-timeseries = ">=1.1.0"
+pandas = ">=2.2.0"
+
+[build-system]
+requires = ["poetry-core>=1.9.0"]
+build-backend = "poetry.core.masonry.api"

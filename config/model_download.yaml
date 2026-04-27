@@ -1,0 +1,10 @@
+model:
+  repo_id: "amazon/chronos-bolt-base"
+  revision: null
+  allow_patterns: null
+  ignore_patterns: null
+
+download:
+  output_dir: "./artifacts/base-models/chronos-bolt-base"
+  force_download: false
+  local_dir_use_symlinks: false
